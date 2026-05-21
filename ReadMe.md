@@ -424,9 +424,9 @@ target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url tcp://192.168.
 ```
 
 > Metal/macOS requires `--pd-url` (no LocalIPC support).
-
 <details>
-<summary>Multi-container (file:// mode)</summary>
+<summary>Multi-container（file:// mode）</summary>
+
 ```bash
 mkdir -p /tmp/pd-sockets
 
@@ -438,6 +438,7 @@ target/release/vllm-rs --d 0,1 --m Qwen/... --pd-server --pd-url file:///sockets
 docker run --gpus '"device=2,3"' -v /tmp/pd-sockets:/sockets ...
 target/release/vllm-rs --d 0,1 --w /path/... --pd-client --pd-url file:///sockets --ui-server --port 8000
 ```
+
 </details>
 
 ## 🔌 MCP Tool Calling
