@@ -24,15 +24,21 @@
 
 ### 📦 安装
 
-**方式 1 — npm（最简单）**
+**方式 1 — Python 安装包**
+```bash
+curl -sSL https://guoqingbao.github.io/xinfer/install.sh | bash
+# python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+```
+
+**方式 2 — npm**
 ```bash
 npm install -g xinfer-ai
-xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+# xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
 npm 包会自动检测 GPU 的 CUDA 计算能力并下载对应的预编译二进制文件。
 
-**方式 2 — Cargo（从源码安装）**
+**方式 3 — Cargo（从源码安装）**
 ```bash
 # 依赖项: Rust 编译器、CUDA 工具链（可选）、Metal 需安装 Xcode 命令行工具（可选）
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -44,23 +50,10 @@ export XINFER_REPO="https://github.com/guoqingbao/xinfer"
 cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 ```
 
-**方式 3 — pip（Python）**
-```bash
-# 自动检测 GPU 并安装对应版本：
-curl -sSL https://guoqingbao.github.io/xinfer/install.sh | bash
-
-# 或手动安装 — 设置 XINFER_PLATFORM 为目标平台：
-#   sm70 (V100/Turing) | sm80 (A100/RTX 30xx/40xx) | sm90 (H100/H200)
-#   sm120 (B200/RTX 50xx) | metal (macOS Apple Silicon)
-XINFER_PLATFORM=sm80 pip install xinfer --index-url https://guoqingbao.github.io/xinfer/${XINFER_PLATFORM}/
-```
-
 **方式 4 — Docker**
 ```bash
-# 修改 sm 版本，示例：Hopper (sm_90, CUDA 13.0.0)，sm_100/sm_120 (Blackwell)
 # Turing/V100 (sm_70/sm_75)：去掉 `flashinfer` 和 `cutlass` 编译选项
-# 增加额外参数 1 启用中国大陆 Rust crate 镜像
-./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_90 13.0.0
+./build_docker.sh "cuda,nccl,flashinfer,cutlass"
 ```
 
 参考 [Docker 指南 →](docs/docker.md)

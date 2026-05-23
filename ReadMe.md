@@ -24,13 +24,19 @@
 
 ### 📦 Install
 
-**Option 1 — npm (easiest)**
+**Option 1 — Python package**
 ```bash
-npm install -g xinfer-ai
-xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+curl -sSL https://guoqingbao.github.io/xinfer/install.sh | bash
+# python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
-**Option 2 — Cargo (from source)**
+**Option 2 — npm**
+```bash
+npm install -g xinfer-ai
+# xinfer --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
+```
+
+**Option 3 — Cargo (from source)**
 ```bash
 # Prerequisites: Rust compiler, CUDA Toolkit (optional) or Metal Xcode command line tool
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -42,22 +48,10 @@ export XINFER_REPO="https://github.com/guoqingbao/xinfer"
 cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 ```
 
-**Option 3 — pip (Python)**
-```bash
-# Auto-detect GPU and install the matching wheel:
-curl -sSL https://guoqingbao.github.io/xinfer/install.sh | bash
-
-# Or install manually — set XINFER_PLATFORM to your target:
-#   sm70 (V100/Turing) | sm80 (A100/RTX 30xx/40xx) | sm90 (H100/H200)
-#   sm120 (B200/RTX 50xx) | metal (macOS Apple Silicon)
-XINFER_PLATFORM=sm80 pip install xinfer --index-url https://guoqingbao.github.io/xinfer/${XINFER_PLATFORM}/
-```
-
 **Option 4 — Docker**
 ```bash
-# Change sm version, example: Hopper (sm_90, CUDA 13.0.0), sm_100/sm_120 (Blackwell)
 # Turing/V100 (sm_70/sm_75): remove `flashinfer` and `cutlass` features
-./build_docker.sh "cuda,nccl,flashinfer,cutlass" sm_80 13.0.0
+./build_docker.sh "cuda,nccl,flashinfer,cutlass"
 ```
 
 See [Docker guide →](docs/docker.md)
@@ -78,6 +72,7 @@ xinfer --w /home/Qwen3.6-35B-A3B --d 0,1 --ui-server
 
 **Python usage:**
 ```bash
+# python3 -m xinfer.chat
 python3 -m xinfer.server --m Qwen/Qwen3.6-27B-FP8 --kvcache-dtype turbo4 --ui-server
 ```
 
