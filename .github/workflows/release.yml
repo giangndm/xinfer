@@ -224,8 +224,14 @@ jobs:
         with:
           targets: ${{ matrix.rust_target }}
 
+      - name: Install maturin
+        run: pip3 install --break-system-packages maturin
+
       - name: Build xinfer binary
         run: cargo build --release --target ${{ matrix.rust_target }} --bin xinfer --features "metal"
+
+      - name: Build Python wheel
+        run: maturin build --release --features "metal,python"
 
       - name: Package tar.gz
         run: |
@@ -234,10 +240,22 @@ jobs:
           tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-${{ matrix.npm_target }}-metal.tar.gz" xinfer
           rm -rf dist/xinfer
 
+      - name: Collect wheel
+        run: |
+          mkdir -p dist/wheels
+          for whl in target/wheels/*.whl; do
+            base="$(basename "$whl")"
+            tagged="$(echo "$base" | sed 's/-cp/-metal-cp/')"
+            cp "$whl" "dist/wheels/$tagged"
+          done
+          ls -la dist/wheels/
+
       - uses: actions/upload-artifact@v4
         with:
           name: xinfer-${{ matrix.npm_target }}-metal
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/wheels/*.whl
 
   # ---------------------------------------------------------------------------
   # Checksums + GitHub Release
@@ -278,8 +296,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Publish wheel index to GitHub Pages (PEP 503 simple repository)
-  # Users install with: pip install xinfer --index-url https://guoqingbao.github.io/xinfer/
-  # (URL resolves correctly after repo is renamed from vllm.rs to xinfer)
+  # Each CUDA arch gets its own index URL:
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm80/  (default)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm70/  (V100)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm90/  (Hopper)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/sm120/ (Blackwell)
+  #   pip install xinfer --index-url https://guoqingbao.github.io/xinfer/metal/ (macOS)
+  # The root index (no arch) defaults to SM80.
   # ---------------------------------------------------------------------------
   publish-index:
     name: publish-index
@@ -304,23 +327,82 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          mkdir -p site/xinfer
           RELEASE_BASE="https://github.com/${REPO}/releases/download/${TAG}"
 
-          {
-            echo '<!DOCTYPE html><html><body>'
-            for whl in dist/wheels/*.whl; do
-              [ -f "$whl" ] || continue
-              name="$(basename "$whl")"
-              sha="$(sha256sum "$whl" | cut -d' ' -f1)"
-              echo "<a href=\"${RELEASE_BASE}/${name}#sha256=${sha}\">${name}</a><br/>"
-            done
-            echo '</body></html>'
-          } > site/xinfer/index.html
+          generate_index() {
+            local dir="$1" orig_name="$2" std_name="$3" sha="$4"
+            mkdir -p "site/${dir}/xinfer"
+            {
+              echo '<!DOCTYPE html><html><body>'
+              echo "<a href=\"${RELEASE_BASE}/${orig_name}#sha256=${sha}\">${std_name}</a><br/>"
+              echo '</body></html>'
+            } > "site/${dir}/xinfer/index.html"
+            echo "<!DOCTYPE html><html><body><a href=\"xinfer/\">xinfer</a></body></html>" \
+              > "site/${dir}/index.html"
+          }
+
+          for whl in dist/wheels/*.whl; do
+            [ -f "$whl" ] || continue
+            orig_name="$(basename "$whl")"
+            sha="$(sha256sum "$whl" | cut -d' ' -f1)"
+
+            # Detect variant tag from filename: SM number or "metal"
+            tag="$(echo "$orig_name" | sed -n 's/.*-\([0-9]\{2,3\}\)-cp.*/\1/p')"
+            if [ -n "$tag" ]; then
+              std_name="$(echo "$orig_name" | sed "s/-${tag}-cp/-cp/")"
+              generate_index "sm${tag}" "$orig_name" "$std_name" "$sha"
+              if [ "$tag" = "80" ]; then
+                mkdir -p "site/xinfer"
+                cp "site/sm${tag}/xinfer/index.html" "site/xinfer/index.html"
+              fi
+            elif echo "$orig_name" | grep -q '\-metal\-cp'; then
+              std_name="$(echo "$orig_name" | sed 's/-metal-cp/-cp/')"
+              generate_index "metal" "$orig_name" "$std_name" "$sha"
+            fi
+          done
 
           echo '<!DOCTYPE html><html><body><a href="xinfer/">xinfer</a></body></html>' > site/index.html
-          echo "Generated index:"
-          cat site/xinfer/index.html
+
+          # Auto-detect install script
+          cat > site/install.sh << 'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          INDEX_BASE="https://guoqingbao.github.io/xinfer"
+
+          detect_platform() {
+            if [ "$(uname -s)" = "Darwin" ]; then
+              echo "metal"
+              return
+            fi
+            if ! command -v nvidia-smi &>/dev/null; then
+              echo "No NVIDIA GPU detected. Use: XINFER_PLATFORM=sm80 pip install xinfer --index-url ${INDEX_BASE}/sm80/" >&2
+              exit 1
+            fi
+            local cc
+            cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits | head -1 | tr -d '[:space:]' | tr -d '.')"
+            case "$cc" in
+              70|72) echo "sm70" ;;
+              75)    echo "sm75" ;;
+              80|86) echo "sm80" ;;
+              89)    echo "sm89" ;;
+              90|90a) echo "sm90" ;;
+              100|120) echo "sm${cc}" ;;
+              *) echo "sm80" ;;
+            esac
+          }
+
+          PLATFORM="${XINFER_PLATFORM:-$(detect_platform)}"
+          echo "Detected platform: ${PLATFORM}"
+          echo "Installing: pip install xinfer --index-url ${INDEX_BASE}/${PLATFORM}/"
+          pip install xinfer --index-url "${INDEX_BASE}/${PLATFORM}/"
+          SCRIPT
+          sed -i 's/^          //' site/install.sh
+          chmod +x site/install.sh
+
+          echo "=== Generated indexes ==="
+          for idx in site/*/xinfer/index.html site/xinfer/index.html; do
+            [ -f "$idx" ] && echo "--- $idx ---" && cat "$idx"
+          done
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

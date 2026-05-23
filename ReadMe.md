@@ -47,7 +47,13 @@ cargo install --git $XINFER_REPO xinfer --features cuda,nccl,flashinfer,cutlass
 
 **Option 3 — pip (Python)**
 ```bash
-pip install xinfer --index-url https://guoqingbao.github.io/xinfer/
+# Auto-detect GPU and install the matching wheel:
+curl -sSL https://guoqingbao.github.io/xinfer/install.sh | bash
+
+# Or install manually — set XINFER_PLATFORM to your target:
+#   sm70 (V100/Turing) | sm80 (A100/RTX 30xx/40xx) | sm90 (H100/H200)
+#   sm120 (B200/RTX 50xx) | metal (macOS Apple Silicon)
+XINFER_PLATFORM=sm80 pip install xinfer --index-url https://guoqingbao.github.io/xinfer/${XINFER_PLATFORM}/
 ```
 
 **Option 4 — Docker**
