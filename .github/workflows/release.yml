@@ -367,7 +367,10 @@ jobs:
           cat > site/install.sh << 'SCRIPT'
           #!/usr/bin/env bash
           set -euo pipefail
+
+          VERSION="__VERSION__"
           INDEX_BASE="https://guoqingbao.github.io/xinfer"
+          RELEASE_BASE="https://github.com/__REPO__/releases/download/v${VERSION}"
 
           detect_platform() {
             if [ "$(uname -s)" = "Darwin" ]; then
@@ -375,7 +378,8 @@ jobs:
               return
             fi
             if ! command -v nvidia-smi &>/dev/null; then
-              echo "No NVIDIA GPU detected. Use: XINFER_PLATFORM=sm80 pip install xinfer --index-url ${INDEX_BASE}/sm80/" >&2
+              echo "ERROR: No NVIDIA GPU detected and no platform specified." >&2
+              echo "  Set XINFER_PLATFORM=sm80 (or sm70/sm75/sm89/sm90/sm120) and re-run." >&2
               exit 1
             fi
             local cc
@@ -393,9 +397,165 @@ jobs:
 
           PLATFORM="${XINFER_PLATFORM:-$(detect_platform)}"
           echo "Detected platform: ${PLATFORM}"
-          echo "Installing: pip install xinfer --index-url ${INDEX_BASE}/${PLATFORM}/"
-          pip install xinfer --index-url "${INDEX_BASE}/${PLATFORM}/"
+          echo ""
+
+          need_sudo() {
+            [ "$(id -u)" -ne 0 ]
+          }
+
+          SUDO=""
+          if need_sudo; then
+            if command -v sudo &>/dev/null; then
+              SUDO="sudo"
+            fi
+          fi
+
+          print_binary_hints() {
+            echo ""
+            echo "============================================"
+            echo " xInfer binary installed"
+            echo "============================================"
+            echo ""
+            echo " HuggingFace model:"
+            echo "   xinfer --m Qwen/Qwen3-8B --ui-server"
+            echo ""
+            echo " Local model path:"
+            echo "   xinfer --w /path/to/model --ui-server"
+            echo ""
+            echo " API server (no UI):"
+            echo "   xinfer --m Qwen/Qwen3-8B --server"
+            echo "============================================"
+          }
+
+          install_deb() {
+            local variant="$1"
+            local deb="xinfer-linux-x64-${variant}.deb"
+            local url="${RELEASE_BASE}/${deb}"
+            local tmp
+            tmp="$(mktemp -d)"
+            echo "Downloading ${deb}..."
+            if ! curl -fSL -o "${tmp}/${deb}" "$url"; then
+              echo "ERROR: Failed to download ${url}" >&2
+              rm -rf "$tmp"
+              return 1
+            fi
+            echo "Installing ${deb}..."
+            if ! ${SUDO} dpkg -i "${tmp}/${deb}"; then
+              echo ""
+              echo "ERROR: dpkg -i failed. You may need root privileges:" >&2
+              echo "  sudo dpkg -i ${tmp}/${deb}" >&2
+              echo "  Or re-run with: curl -sSL ${INDEX_BASE}/install.sh | sudo bash" >&2
+              return 1
+            fi
+            rm -rf "$tmp"
+            print_binary_hints
+          }
+
+          install_tarball() {
+            local tarball="$1"
+            local url="${RELEASE_BASE}/${tarball}"
+            local install_dir="/usr/local/bin"
+            local tmp
+            tmp="$(mktemp -d)"
+            echo "Downloading ${tarball}..."
+            if ! curl -fSL -o "${tmp}/${tarball}" "$url"; then
+              echo "ERROR: Failed to download ${url}" >&2
+              rm -rf "$tmp"
+              return 1
+            fi
+            echo "Extracting..."
+            tar -xzf "${tmp}/${tarball}" -C "${tmp}"
+            echo "Installing xinfer to ${install_dir}..."
+            if ! ${SUDO} install -m 755 "${tmp}/xinfer" "${install_dir}/xinfer"; then
+              echo ""
+              echo "ERROR: Could not install to ${install_dir}." >&2
+              echo "  Try: sudo install -m 755 ${tmp}/xinfer ${install_dir}/xinfer" >&2
+              echo "  Or re-run with: curl -sSL ${INDEX_BASE}/install.sh | sudo bash" >&2
+              return 1
+            fi
+            rm -rf "$tmp"
+            print_binary_hints
+          }
+
+          install_pip() {
+            local platform="$1"
+            local PIP=""
+            if command -v pip3 &>/dev/null; then
+              PIP=pip3
+            elif command -v pip &>/dev/null; then
+              PIP=pip
+            else
+              echo "ERROR: pip not found. Install Python 3 first." >&2
+              return 1
+            fi
+            echo "Installing: ${PIP} install xinfer --index-url ${INDEX_BASE}/${platform}/"
+            if ! ${PIP} install xinfer --index-url "${INDEX_BASE}/${platform}/"; then
+              echo ""
+              echo "ERROR: pip install failed." >&2
+              echo "  Try: ${SUDO:+sudo }${PIP} install xinfer --index-url ${INDEX_BASE}/${platform}/" >&2
+              return 1
+            fi
+            echo ""
+            echo "============================================"
+            echo " xInfer installed via Python package"
+            echo "============================================"
+            echo ""
+            echo " HuggingFace model:"
+            echo "   python3 -m xinfer.server --m Qwen/Qwen3-8B --ui-server"
+            echo ""
+            echo " Local model path:"
+            echo "   python3 -m xinfer.server --w /path/to/model --ui-server"
+            echo ""
+            echo " API server (no UI):"
+            echo "   python3 -m xinfer.server --m Qwen/Qwen3-8B --server"
+            echo "============================================"
+          }
+
+          if [ "$PLATFORM" = "metal" ]; then
+            TARBALL="xinfer-${VERSION}-darwin-arm64-metal.tar.gz"
+            echo "Install options:"
+            echo "  1) binary  — installs 'xinfer' to /usr/local/bin"
+            echo "  2) pip     — installs 'python3 -m xinfer.server'"
+            echo ""
+          else
+            TARBALL="xinfer-${VERSION}-linux-x64-${PLATFORM}.tar.gz"
+            echo "Install options:"
+            echo "  1) deb package  — installs 'xinfer' system-wide (Linux)"
+            echo "  2) pip package  — installs 'python3 -m xinfer.server'"
+            echo "  3) binary       — installs 'xinfer' to /usr/local/bin"
+            echo ""
+          fi
+
+          MODE="${XINFER_MODE:-}"
+          if [ -z "$MODE" ]; then
+            if [ -t 0 ]; then
+              printf "Choose [1/2%s] (default: 1): " "$([ "$PLATFORM" != "metal" ] && echo "/3")"
+              read -r MODE
+              MODE="${MODE:-1}"
+            else
+              MODE="1"
+            fi
+          fi
+
+          if [ "$PLATFORM" = "metal" ]; then
+            case "$MODE" in
+              1|binary)  install_tarball "$TARBALL" ;;
+              2|pip)     install_pip "$PLATFORM" ;;
+              *)         echo "Invalid choice: $MODE"; exit 1 ;;
+            esac
+          else
+            case "$MODE" in
+              1|deb)     install_deb "$PLATFORM" ;;
+              2|pip)     install_pip "$PLATFORM" ;;
+              3|binary)  install_tarball "$TARBALL" ;;
+              *)         echo "Invalid choice: $MODE"; exit 1 ;;
+            esac
+          fi
           SCRIPT
+
+          # Substitute version and repo into the script
+          sed -i "s|__VERSION__|${VERSION}|g" site/install.sh
+          sed -i "s|__REPO__|${REPO}|g" site/install.sh
           sed -i 's/^          //' site/install.sh
           chmod +x site/install.sh
 
