@@ -28,9 +28,9 @@ jobs:
         id: version
         run: |
           cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          npm_version="$(node -p "require('./npm/package.json').version")"
-          if [ "$cargo_version" != "$npm_version" ]; then
-            echo "Cargo.toml version ($cargo_version) must match npm/package.json version ($npm_version)" >&2
+          npm_asset="$(node -p "require('./npm/package.json').assetVersion || require('./npm/package.json').version")"
+          if [ "$cargo_version" != "$npm_asset" ]; then
+            echo "Cargo.toml version ($cargo_version) must match npm/package.json assetVersion ($npm_asset)" >&2
             exit 1
           fi
           expected_tag="v${cargo_version}"
@@ -103,6 +103,22 @@ jobs:
           . "$HOME/.cargo/env"
           ./build.sh --release --features "${{ matrix.python_features }}"
 
+      - name: Bundle CUDA runtime with binary
+        run: |
+          CUDA_LIB="$(find /usr/local/cuda -follow -name 'libcudart.so.*.*' -not -name '*.a' 2>/dev/null | head -1)"
+          if [ -z "$CUDA_LIB" ]; then CUDA_LIB="$(ldconfig -p | grep 'libcudart.so\.' | awk '{print $NF}' | head -1)"; fi
+          mkdir -p target/release/lib
+          if [ -n "$CUDA_LIB" ]; then
+            cp "$CUDA_LIB" target/release/lib/
+            CUDA_SONAME="$(objdump -p "$CUDA_LIB" 2>/dev/null | awk '/SONAME/{print $2}')"
+            if [ -n "$CUDA_SONAME" ]; then
+              ln -sf "$(basename "$CUDA_LIB")" "target/release/lib/$CUDA_SONAME"
+              ln -sf "$CUDA_SONAME" target/release/lib/libcudart.so
+            fi
+          fi
+          patchelf --set-rpath '$ORIGIN/lib:/usr/local/lib/xinfer' target/release/xinfer
+          ls -la target/release/lib/
+
       - name: Package deb
         run: |
           . "$HOME/.cargo/env"
@@ -112,7 +128,8 @@ jobs:
         run: |
           mkdir -p dist/xinfer
           cp target/release/xinfer dist/xinfer/xinfer
-          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer
+          cp -a target/release/lib dist/xinfer/lib
+          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer lib
           rm -rf dist/xinfer
 
       - name: Collect and tag wheel with SM variant
@@ -177,6 +194,22 @@ jobs:
       - name: Build Python wheel
         run: ./build.sh --release --features "${{ matrix.python_features }}"
 
+      - name: Bundle CUDA runtime with binary
+        run: |
+          CUDA_LIB="$(find /usr/local/cuda -follow -name 'libcudart.so.*.*' -not -name '*.a' 2>/dev/null | head -1)"
+          if [ -z "$CUDA_LIB" ]; then CUDA_LIB="$(ldconfig -p | grep 'libcudart.so\.' | awk '{print $NF}' | head -1)"; fi
+          mkdir -p target/release/lib
+          if [ -n "$CUDA_LIB" ]; then
+            cp "$CUDA_LIB" target/release/lib/
+            CUDA_SONAME="$(objdump -p "$CUDA_LIB" 2>/dev/null | awk '/SONAME/{print $2}')"
+            if [ -n "$CUDA_SONAME" ]; then
+              ln -sf "$(basename "$CUDA_LIB")" "target/release/lib/$CUDA_SONAME"
+              ln -sf "$CUDA_SONAME" target/release/lib/libcudart.so
+            fi
+          fi
+          patchelf --set-rpath '$ORIGIN/lib:/usr/local/lib/xinfer' target/release/xinfer
+          ls -la target/release/lib/
+
       - name: Package deb
         run: cargo deb --no-build --output "dist/xinfer-linux-x64-${{ matrix.sm_name }}.deb"
 
@@ -184,7 +217,8 @@ jobs:
         run: |
           mkdir -p dist/xinfer
           cp target/release/xinfer dist/xinfer/xinfer
-          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer
+          cp -a target/release/lib dist/xinfer/lib
+          tar -C dist/xinfer -czf "dist/xinfer-${{ needs.validate.outputs.version }}-linux-x64-${{ matrix.sm_name }}.tar.gz" xinfer lib
           rm -rf dist/xinfer
 
       - name: Collect and tag wheel with SM variant
@@ -455,6 +489,7 @@ jobs:
             local tarball="$1"
             local url="${RELEASE_BASE}/${tarball}"
             local install_dir="/usr/local/bin"
+            local lib_dir="/usr/local/lib/xinfer"
             local tmp
             tmp="$(mktemp -d)"
             echo "Downloading ${tarball}..."
@@ -472,6 +507,10 @@ jobs:
               echo "  Try: sudo install -m 755 ${tmp}/xinfer ${install_dir}/xinfer" >&2
               echo "  Or re-run with: curl -sSL ${INDEX_BASE}/install.sh | sudo bash" >&2
               return 1
+            fi
+            if [ -d "${tmp}/lib" ]; then
+              ${SUDO} mkdir -p "${lib_dir}"
+              ${SUDO} cp -a "${tmp}/lib/"* "${lib_dir}/"
             fi
             rm -rf "$tmp"
             print_binary_hints
@@ -528,9 +567,9 @@ jobs:
 
           MODE="${XINFER_MODE:-}"
           if [ -z "$MODE" ]; then
-            if [ -t 0 ]; then
+            if [ -e /dev/tty ]; then
               printf "Choose [1/2%s] (default: 1): " "$([ "$PLATFORM" != "metal" ] && echo "/3")"
-              read -r MODE
+              read -r MODE < /dev/tty
               MODE="${MODE:-1}"
             else
               MODE="1"
@@ -592,6 +631,17 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+      - name: Sync npm package version with release tag
+        if: env.NODE_AUTH_TOKEN != ''
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          cd npm
+          node -e "
+            const pkg = require('./package.json');
+            pkg.version = '${VERSION}';
+            pkg.assetVersion = '${VERSION}';
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
       - name: Publish npm package
         if: env.NODE_AUTH_TOKEN != ''
         run: npm publish ./npm --access public --provenance
