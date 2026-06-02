@@ -854,6 +854,13 @@ pub struct QuantConfig {
     pub quant_algo: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
+    #[serde(default)]
+    pub quantized_layers: Option<serde_json::Value>,
+    /// MLX NVFP4 uses U32-packed weights (8 nibbles per U32) instead of U8
+    /// (2 nibbles per byte). Set during normalize_compressed_tensors when
+    /// an MLX-style `"mode": "nvfp4"` config is detected.
+    #[serde(default)]
+    pub is_mlx_nvfp4: bool,
 }
 
 impl QuantConfig {
@@ -863,12 +870,26 @@ impl QuantConfig {
     ///   1. `modelopt` with `quant_algo` == `NVFP4` / `FP4`
     ///   2. `compressed-tensors` with `format` containing `nvfp4` or `mxfp4`
     ///   3. `compressed-tensors` detected from `config_groups` content
-    ///
-    /// MLX-style quantization (`"mode": "nvfp4"/"mxfp4"`) uses an incompatible
-    /// packing format (U32 weights, integer scales) and is NOT supported.
+    ///   4. MLX-style `"mode": "nvfp4"` — weights are U32-packed (8 nibbles per
+    ///      U32) with FP8 E4M3 scales, no global_scale. Repacked to U8 at load.
     ///
     /// Also extracts group_size / bits from config_groups when present.
     pub fn normalize_compressed_tensors(&mut self) {
+        if self.quant_method.is_empty() {
+            if let Some(mode) = &self.mode {
+                if mode.eq_ignore_ascii_case("nvfp4") {
+                    self.quant_method = "nvfp4".to_string();
+                    self.is_mlx_nvfp4 = true;
+                    if self.group_size == 0 {
+                        self.group_size = 16;
+                    }
+                    if self.bits == 0 {
+                        self.bits = 4;
+                    }
+                    return;
+                }
+            }
+        }
         // modelopt: {"quant_method": "modelopt", "quant_algo": "NVFP4"}
         if self.quant_method == "modelopt" {
             if let Some(algo) = &self.quant_algo {
@@ -880,6 +901,22 @@ impl QuantConfig {
                     }
                     if self.bits == 0 {
                         self.bits = 4;
+                    }
+                    return;
+                }
+                if algo.eq_ignore_ascii_case("FP8") {
+                    self.quant_method = "fp8".to_string();
+                    return;
+                }
+                if algo.eq_ignore_ascii_case("MIXED_PRECISION") {
+                    if self.detect_nvfp4_from_config_groups()
+                        || self.detect_nvfp4_from_quantized_layers()
+                    {
+                        self.quant_method = "nvfp4".to_string();
+                        self.bits = 4;
+                        self.group_size = 16;
+                    } else if self.detect_fp8_from_quantized_layers() {
+                        self.quant_method = "fp8".to_string();
                     }
                     return;
                 }
@@ -993,6 +1030,40 @@ impl QuantConfig {
         false
     }
 
+    fn detect_nvfp4_from_quantized_layers(&self) -> bool {
+        let layers = match &self.quantized_layers {
+            Some(v) => v,
+            None => return false,
+        };
+        if let Some(obj) = layers.as_object() {
+            for (_key, layer_info) in obj {
+                if let Some(algo) = layer_info.get("quant_algo").and_then(|v| v.as_str()) {
+                    if algo.contains("NVFP4") || algo.contains("nvfp4") {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn detect_fp8_from_quantized_layers(&self) -> bool {
+        let layers = match &self.quantized_layers {
+            Some(v) => v,
+            None => return false,
+        };
+        if let Some(obj) = layers.as_object() {
+            for (_key, layer_info) in obj {
+                if let Some(algo) = layer_info.get("quant_algo").and_then(|v| v.as_str()) {
+                    if algo == "FP8" || algo == "fp8" {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn extract_compressed_tensors_params(&mut self) {
         let groups = match &self.config_groups {
             Some(v) => v.clone(),
@@ -1042,6 +1113,7 @@ impl fmt::Debug for QuantConfig {
             .field("format", &self.format)
             .field("weight_block_size", &self.weight_block_size)
             .field("modules_to_not_convert", &self.modules_to_not_convert)
+            .field("is_mlx_nvfp4", &self.is_mlx_nvfp4)
             .finish()
     }
 }
@@ -1137,6 +1209,8 @@ mod tests {
             config_groups: None,
             quant_algo: None,
             mode: None,
+            quantized_layers: None,
+            is_mlx_nvfp4: false,
         };
         assert!(cfg.should_skip_module("model.layers.0.self_attn.q_proj"));
         assert!(cfg.should_skip_module("model.layers.5.linear_attn.out_proj"));
@@ -1471,10 +1545,10 @@ mod tests {
     }
 
     #[test]
-    fn test_mlx_nvfp4_not_normalized() {
-        // MLX-community models use an incompatible quantization format:
-        // U32-packed weights + integer U8 scales (NOT FP8 E4M3 block scales).
-        // These must NOT be normalized to our "nvfp4" quant_method.
+    fn test_mlx_nvfp4_normalized() {
+        // MLX-community models use U32-packed weights with FP8 E4M3 scales.
+        // They should normalize to "nvfp4" with is_mlx_nvfp4 = true, and
+        // the weight loader repacks U32 → U8 at load time.
         let json = r#"{
             "group_size": 16,
             "bits": 4,
@@ -1483,10 +1557,10 @@ mod tests {
         let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.quant_method, "");
         cfg.normalize_compressed_tensors();
-        assert_eq!(
-            cfg.quant_method, "",
-            "MLX mode=nvfp4 must not normalize to nvfp4"
-        );
+        assert_eq!(cfg.quant_method, "nvfp4");
+        assert!(cfg.is_mlx_nvfp4, "MLX mode=nvfp4 must set is_mlx_nvfp4");
+        assert_eq!(cfg.group_size, 16);
+        assert_eq!(cfg.bits, 4);
     }
 
     #[test]
@@ -1561,5 +1635,62 @@ mod tests {
         assert_eq!(cfg.quant_method, "nvfp4");
         assert_eq!(cfg.bits, 4);
         assert_eq!(cfg.group_size, 16);
+    }
+
+    #[test]
+    fn test_mixed_precision_nvfp4_fp8_from_quantized_layers() {
+        let json = r#"{
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "config_groups": {
+                "group_0": {
+                    "input_activations": {"dynamic": false, "num_bits": 8, "type": "float"},
+                    "weights": {"dynamic": false, "num_bits": 8, "type": "float"},
+                    "targets": ["model.layers.0.linear_attn.in_proj_qkv"]
+                },
+                "group_1": {
+                    "input_activations": {"dynamic": false, "num_bits": 4, "type": "float", "group_size": 16},
+                    "weights": {"dynamic": false, "num_bits": 4, "type": "float", "group_size": 16},
+                    "targets": ["model.layers.0.mlp.experts"]
+                }
+            },
+            "quantized_layers": {
+                "model.layers.0.linear_attn.in_proj_qkv": {"quant_algo": "FP8"},
+                "model.layers.0.mlp.experts": {"quant_algo": "W4A16_NVFP4", "group_size": 16}
+            },
+            "ignore": ["mtp*"]
+        }"#;
+        let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
+        cfg.normalize_compressed_tensors();
+        assert_eq!(cfg.quant_method, "nvfp4");
+        assert_eq!(cfg.group_size, 16);
+        assert_eq!(cfg.bits, 4);
+    }
+
+    #[test]
+    fn test_mixed_precision_fp8_only_from_quantized_layers() {
+        let json = r#"{
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"},
+                "model.layers.0.self_attn.k_proj": {"quant_algo": "FP8"}
+            },
+            "ignore": ["mtp*"]
+        }"#;
+        let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
+        cfg.normalize_compressed_tensors();
+        assert_eq!(cfg.quant_method, "fp8");
+    }
+
+    #[test]
+    fn test_modelopt_fp8_normalization() {
+        let json = r#"{
+            "quant_method": "modelopt",
+            "quant_algo": "FP8"
+        }"#;
+        let mut cfg: QuantConfig = serde_json::from_str(json).unwrap();
+        cfg.normalize_compressed_tensors();
+        assert_eq!(cfg.quant_method, "fp8");
     }
 }

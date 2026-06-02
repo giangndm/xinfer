@@ -61,10 +61,12 @@ pub struct GatedDeltaNet {
     gdn_layer_idx: usize,
     rms_norm_eps: f64,
     scale: f64,
-    kernel_dtype: DType,
-    /// The dtype that projection weights were loaded in (e.g. F16/BF16).
-    /// Used to cast input before projection when norms output a different dtype (e.g. F32).
-    projection_dtype: DType,
+    /// The dtype for GDN core ops (conv1d, gating, recurrence).
+    /// For GGUF/F16 mode: F32; otherwise: model dtype (BF16/F16).
+    gdn_dtype: DType,
+    /// The model's native dtype (BF16/F16). Used for projection input and weight loading.
+    /// Quantized projections (FP8/NVFP4/QLinear) handle dtype internally.
+    model_dtype: DType,
 }
 
 impl GatedDeltaNet {
@@ -81,17 +83,32 @@ impl GatedDeltaNet {
             "nvfp4" => {
                 let has_packed = vb.has_key("weight_packed") || vb.has_key("blocks");
                 let has_scale = vb.has_key("weight_scale") || vb.has_key("scales");
-                let has_modelopt = vb.has_key("weight_scale_2") || vb.has_key("input_scale");
-                (has_packed && has_scale) || (has_modelopt && has_scale)
+                let has_nvfp4_second_scale =
+                    vb.has_key("weight_scale_2") || vb.has_key("weight_global_scale");
+                // MLX NVFP4: just "weight" (U32) + "scales" (U8), no separate global scale
+                let is_mlx_nvfp4 = vb.has_key("weight")
+                    && vb.has_key("scales")
+                    && !has_packed
+                    && !has_nvfp4_second_scale;
+                (has_packed && has_scale) || (has_nvfp4_second_scale && has_scale) || is_mlx_nvfp4
             }
             "gptq" | "awq" => vb.has_key("qweight") || vb.has_key("B"),
             _ => true,
         }
     }
 
+    fn is_weight_fp8(vb: &VarBuilderX) -> bool {
+        if vb.is_qvar_builder() {
+            return false;
+        }
+        vb.has_key("weight_scale") || vb.has_key("weight_scale_inv")
+    }
+
     /// Resolve effective quantization config for a specific weight.
     /// If the weight is not actually quantized, returns (None, None) so
     /// the loader falls back to the standard unquantized path.
+    /// For mixed-precision models (nvfp4 global with FP8 per-weight), detects
+    /// FP8 weights and returns an FP8 config so they load correctly.
     fn resolve_quant_for_weight(
         vb: &VarBuilderX,
         quantization_config: &Option<crate::utils::config::QuantConfig>,
@@ -100,6 +117,11 @@ impl GatedDeltaNet {
         if let Some(cfg) = quantization_config {
             if Self::is_weight_quantized(vb, &cfg.quant_method) {
                 return (quantization_config.clone(), quant.clone());
+            }
+            if cfg.quant_method == "nvfp4" && Self::is_weight_fp8(vb) {
+                let mut fp8_cfg = cfg.clone();
+                fp8_cfg.quant_method = "fp8".to_string();
+                return (Some(fp8_cfg), quant.clone());
             }
         }
         (None, None)
@@ -395,11 +417,10 @@ impl GatedDeltaNet {
         &self,
         xs: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
-        // When norms output F32 (is_f16_mode / higher_precision) but projection weights
-        // are in the original model dtype (F16/BF16), cast input to match weights.
-        // GGUF (QLinear) handles this internally, but unquantized Linear requires matching dtypes.
-        let xs = &if xs.dtype() != self.projection_dtype {
-            xs.to_dtype(self.projection_dtype)?
+        // Cast to model_dtype for projection input: unquantized (BF16 Linear), FP8, and
+        // NVFP4 all accept BF16/F16. GGUF (QLinear) handles input dtype internally.
+        let xs = &if xs.dtype() != self.model_dtype {
+            xs.to_dtype(self.model_dtype)?
         } else {
             xs.clone()
         };
@@ -501,16 +522,8 @@ impl GatedDeltaNet {
         }
 
         let is_quantized = config.quantization_config.is_some();
-        let kernel_dtype = if vb.is_qvar_builder() || config.is_f16_mode {
+        let gdn_dtype = if vb.is_qvar_builder() || config.is_f16_mode {
             DType::F32
-        } else {
-            dtype
-        };
-        // GGUF (QLinear) casts input to F32 internally, so any input dtype works.
-        // Quantized formats (LnFp8/LnNvfp4/LnMxfp4) and unquantized Linear both need
-        // input in the model's weight dtype (F16/BF16).
-        let projection_dtype = if vb.is_qvar_builder() {
-            kernel_dtype
         } else {
             dtype
         };
@@ -546,14 +559,12 @@ impl GatedDeltaNet {
         } else {
             a_log_loaded
         };
-        let mut dt_bias = vb
-            .get_with_hints_dtype(
-                (num_v_heads_global,),
-                gdn_key_map["dt_bias"],
-                sd,
-                DType::F32,
-            )?
-            .to_dtype(kernel_dtype)?;
+        let mut dt_bias = vb.get_with_hints_dtype(
+            (num_v_heads_global,),
+            gdn_key_map["dt_bias"],
+            sd,
+            DType::F32,
+        )?;
         if vb.is_qvar_builder() && num_k_heads_global != num_v_heads_global {
             a_log =
                 undo_tiled_v_heads_first_dim(&a_log, num_k_heads_global, num_v_heads_global, 1)?;
@@ -589,10 +600,21 @@ impl GatedDeltaNet {
             )?
             .unsqueeze(1)?
         } else {
-            vb.get(
+            let w = vb.get(
                 (conv_dim_global, 1, conv_kernel_size),
                 gdn_key_map["conv1d.weight"],
-            )?
+            );
+            match w {
+                Ok(t) => t,
+                Err(_) => {
+                    // MLX stores conv1d weight as (out, kernel, 1) instead of (out, 1, kernel)
+                    vb.get(
+                        (conv_dim_global, conv_kernel_size, 1),
+                        gdn_key_map["conv1d.weight"],
+                    )?
+                    .permute((0, 2, 1))?
+                }
+            }
         };
         let q_start = rank * key_dim;
         let k_start = key_dim_global + rank * key_dim;
@@ -608,7 +630,7 @@ impl GatedDeltaNet {
             )?;
         }
         v_w = tensor_parallel_chunk(&v_w, 0, rank, world_size, "linear_attn.conv1d.weight[v]")?;
-        let conv_weight = Tensor::cat(&[&q_w, &k_w, &v_w], 0)?.to_dtype(kernel_dtype)?;
+        let conv_weight = Tensor::cat(&[&q_w, &k_w, &v_w], 0)?.to_dtype(gdn_dtype)?;
 
         let conv_bias = vb.get((conv_dim_global,), gdn_key_map["conv1d.bias"]).ok();
         let conv_bias = if let Some(cb) = conv_bias {
@@ -624,7 +646,7 @@ impl GatedDeltaNet {
                 )?;
             }
             v_b = tensor_parallel_chunk(&v_b, 0, rank, world_size, "linear_attn.conv1d.bias[v]")?;
-            Some(Tensor::cat(&[&q_b, &k_b, &v_b], 0)?.to_dtype(kernel_dtype)?)
+            Some(Tensor::cat(&[&q_b, &k_b, &v_b], 0)?.to_dtype(gdn_dtype)?)
         } else {
             None
         };
@@ -707,8 +729,12 @@ impl GatedDeltaNet {
             gdn_layer_idx,
             rms_norm_eps: config.rms_norm_eps,
             scale,
-            kernel_dtype,
-            projection_dtype,
+            gdn_dtype,
+            model_dtype: if vb.is_qvar_builder() {
+                DType::F32
+            } else {
+                dtype
+            },
         })
     }
 
@@ -725,23 +751,21 @@ impl GatedDeltaNet {
         }
         let original_dtype = xs.dtype();
 
-        // For GGUF (qvar_builder), input is already F32 — project in F32.
-        // For quantized models (FP8/NVFP4), projections need the model dtype (F16/BF16),
-        // so we project first, THEN convert to kernel_dtype for GDN core ops.
         let (token_count, _hidden) = xs.dims2()?;
         let is_prefill = input_metadata.is_prefill;
         let (q, k, v, z, b, a) = self.project_inputs(xs)?;
 
-        // Convert projection outputs to kernel_dtype for GDN core (conv1d, gating, recurrence).
-        // For GGUF and F16 mode, kernel_dtype is F32 to avoid precision loss.
-        let (q, k, v, z, b, a) = if q.dtype() != self.kernel_dtype {
+        // Upcast projection outputs to gdn_dtype for GDN core ops (conv1d, gating, recurrence).
+        // For GGUF/F16 mode (gdn_dtype=F32), this promotes BF16 outputs to F32.
+        // For standard BF16 models (gdn_dtype=BF16), this is a no-op.
+        let (q, k, v, z, b, a) = if q.dtype() != self.gdn_dtype {
             (
-                q.to_dtype(self.kernel_dtype)?,
-                k.to_dtype(self.kernel_dtype)?,
-                v.to_dtype(self.kernel_dtype)?,
-                z.to_dtype(self.kernel_dtype)?,
-                b.to_dtype(self.kernel_dtype)?,
-                a.to_dtype(self.kernel_dtype)?,
+                q.to_dtype(self.gdn_dtype)?,
+                k.to_dtype(self.gdn_dtype)?,
+                v.to_dtype(self.gdn_dtype)?,
+                z.to_dtype(self.gdn_dtype)?,
+                b.to_dtype(self.gdn_dtype)?,
+                a.to_dtype(self.gdn_dtype)?,
             )
         } else {
             (q, k, v, z, b, a)
@@ -802,38 +826,52 @@ impl GatedDeltaNet {
         let v = v_conv.reshape((token_count, self.num_v_heads, self.head_v_dim))?;
         let q = gdn::l2_norm_last_dim(&q, 1e-6)?;
         let k = gdn::l2_norm_last_dim(&k, 1e-6)?;
-        let (q, k) = (self.repeat_kv_heads(q)?, self.repeat_kv_heads(k)?);
 
         let output = if is_prefill {
-            // S1: Use batched varlen recurrence — one CUDA launch for all sequences
-            let q_scaled = (&q * self.scale)?;
-
             let cu_seqlens = input_metadata
                 .cu_seqlens_q
                 .as_ref()
                 .expect("cu_seqlens_q must be present in prefill!");
 
-            // Get mutable reference to global state for in-place update (optimized prefill)
             let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
 
-            gdn::gated_delta_rule_recurrence_varlen(
-                &q_scaled,
-                &k,
-                &v,
-                &g,
-                &beta,
-                global_state,
-                seq_slots,
-                &cu_seqlens,
-            )?
+            if self.num_k_heads != self.num_v_heads {
+                gdn::gated_delta_rule_recurrence_varlen_gqa(
+                    &q,
+                    &k,
+                    &v,
+                    &g,
+                    &beta,
+                    global_state,
+                    seq_slots,
+                    &cu_seqlens,
+                    self.scale as f32,
+                )?
+            } else {
+                let q_scaled = (&q * self.scale)?;
+                gdn::gated_delta_rule_recurrence_varlen(
+                    &q_scaled,
+                    &k,
+                    &v,
+                    &g,
+                    &beta,
+                    global_state,
+                    seq_slots,
+                    &cu_seqlens,
+                )?
+            }
         } else {
             let batch = slot_count;
-            let q_b = (q.reshape((batch, self.num_v_heads, self.head_k_dim))? * self.scale)?;
-            let k_b = k.reshape((batch, self.num_v_heads, self.head_k_dim))?;
             let v_b = v.reshape((batch, self.num_v_heads, self.head_v_dim))?;
             let g_b = g.reshape((batch, self.num_v_heads))?;
             let beta_b = beta.reshape((batch, self.num_v_heads))?;
             let global_state = mamba_cache.recurrent_state_mut(self.gdn_layer_idx);
+            let (q, k) = (
+                self.repeat_kv_heads(q.clone())?,
+                self.repeat_kv_heads(k.clone())?,
+            );
+            let q_b = (q.reshape((batch, self.num_v_heads, self.head_k_dim))? * self.scale)?;
+            let k_b = k.reshape((batch, self.num_v_heads, self.head_k_dim))?;
             gdn::gated_delta_rule_decode_slots(
                 &q_b,
                 &k_b,
@@ -858,10 +896,9 @@ impl GatedDeltaNet {
             self.head_v_dim,
         )?;
 
-        // Output projection — cast to projection dtype for matmul, then restore original dtype
         let out = self
             .out_proj
-            .forward(&gated_output.to_dtype(self.projection_dtype)?)?;
+            .forward(&gated_output.to_dtype(self.model_dtype)?)?;
         if out.dtype() != original_dtype {
             out.to_dtype(original_dtype)
         } else {
