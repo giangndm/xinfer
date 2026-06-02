@@ -13,11 +13,12 @@ ARG CHINA_MIRROR=0
 RUN set -eux; \
   apt-get update; \
   apt-get install -y --no-install-recommends --allow-change-held-packages \
-    libnccl-dev libnccl2 \
+    libnccl-dev=$(apt-cache madison libnccl-dev | awk -v cuda="$(echo "$CUDA_VERSION" | cut -d'.' -f1,2)" '$0 ~ cuda {print $3; exit}') \
+    libnccl2=$(apt-cache madison libnccl2 | awk -v cuda="$(echo "$CUDA_VERSION" | cut -d'.' -f1,2)" '$0 ~ cuda {print $3; exit}') \
     curl git ca-certificates \
     libssl-dev pkg-config \
     clang libclang-dev \
-    python3-pip; \
+    python3-pip && \
   rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
