@@ -3,9 +3,10 @@
 use crate::models::layers::attention::Attention;
 use crate::models::layers::deltanet::GatedDeltaNet;
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
+use crate::models::layers::hybrid_embedding::HybridEmbedding;
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
-use crate::models::layers::others::{embedding, rms_norm, NormX};
+use crate::models::layers::others::{hybrid_embedding, rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbedding};
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
@@ -14,7 +15,6 @@ use crate::utils::resolve_qwen3_hybrid_config;
 use attention_rs::mamba_cache::MambaCache;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::Module;
 use parking_lot::{RwLock, RwLockWriteGuard};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -184,7 +184,7 @@ impl Qwen3_5DecoderLayer {
 // =============================================================================
 
 pub struct Qwen3_5ForCausalLM {
-    embed_tokens: candle_nn::Embedding,
+    embed_tokens: HybridEmbedding,
     layers: Vec<Qwen3_5DecoderLayer>,
     norm: NormX,
     lm_head: VocabParallelLinear,
@@ -313,7 +313,7 @@ impl Qwen3_5ForCausalLM {
             config.tie_word_embeddings
         };
 
-        let (embed_tokens, vocab_size) = embedding(
+        let (embed_tokens, vocab_size) = hybrid_embedding(
             config.vocab_size,
             config.hidden_size,
             if is_qvar_builder {
@@ -393,42 +393,27 @@ impl Qwen3_5ForCausalLM {
                     .is_some_and(|q| q.is_mlx_nvfp4),
         )?;
 
-        let is_mlx_nvfp4_tied = tie_word_embeddings.is_some_and(|x| x)
-            && config
-                .quantization_config
-                .as_ref()
-                .map_or(false, |q| q.is_mlx_nvfp4);
-        let lm_head = if is_mlx_nvfp4_tied {
-            VocabParallelLinear::from_weight_bias(
-                embed_tokens.embeddings().clone(),
-                None,
-                comm.clone(),
-                vocab_size,
-                dtype,
-            )?
-        } else {
-            VocabParallelLinear::load_no_bias(
-                config.hidden_size,
-                vocab_size,
-                if tie_word_embeddings.is_some_and(|x| x) {
-                    if is_qvar_builder {
-                        vb.pp(&format!("{}{}", gguf_prefix, key_map["embed_tokens"]))
-                    } else {
-                        vb.pp(&format!("{}embed_tokens", prefix))
-                    }
+        let lm_head = VocabParallelLinear::load_no_bias(
+            config.hidden_size,
+            vocab_size,
+            if tie_word_embeddings.is_some_and(|x| x) {
+                if is_qvar_builder {
+                    vb.pp(&format!("{}{}", gguf_prefix, key_map["embed_tokens"]))
                 } else {
-                    if is_qvar_builder {
-                        vb.pp(key_map["lm_head"])
-                    } else {
-                        vb.pp("lm_head")
-                    }
-                },
-                comm.clone(),
-                &None,
-                &None,
-                dtype,
-            )?
-        };
+                    vb.pp(&format!("{}embed_tokens", prefix))
+                }
+            } else {
+                if is_qvar_builder {
+                    vb.pp(key_map["lm_head"])
+                } else {
+                    vb.pp("lm_head")
+                }
+            },
+            comm.clone(),
+            &None,
+            &None,
+            dtype,
+        )?;
 
         // Initialize MambaCache for GDN layers
         let world_size = comm.world_size();
