@@ -6,7 +6,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use parking_lot::Mutex;
 
 /// Default number of token rows retained in the device hot cache.
-pub const DEFAULT_HOT_CACHE_ROWS: usize = 4096;
+pub const DEFAULT_HOT_CACHE_ROWS: usize = 32;
 
 /// Per-lookup cache accounting for observability and benchmark reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,6 +42,7 @@ struct HybridEmbeddingInner {
     hot_order: VecDeque<u32>,
     hot_slots: HashMap<u32, usize>,
     hot_tensor: Option<Tensor>,
+    hot_device: Option<Device>,
     hot_dirty: bool,
     last_stats: HybridEmbeddingLookupStats,
 }
@@ -65,6 +66,7 @@ impl HybridEmbedding {
                 hot_order: VecDeque::with_capacity(hot_cache_rows),
                 hot_slots: HashMap::with_capacity(hot_cache_rows),
                 hot_tensor: None,
+                hot_device: None,
                 hot_dirty: true,
                 last_stats: HybridEmbeddingLookupStats::default(),
             }),
@@ -176,11 +178,13 @@ impl HybridEmbeddingInner {
     }
 
     fn rebuild_hot_tensor_if_needed(&mut self, device: &Device) -> Result<()> {
-        if !self.hot_dirty && self.hot_tensor.is_some() {
+        let hot_device_matches = self.hot_device.as_ref().is_some_and(|hot_device| hot_device.same_device(device));
+        if !self.hot_dirty && self.hot_tensor.is_some() && hot_device_matches {
             return Ok(());
         }
         let ids = self.hot_order.iter().copied().collect::<Vec<_>>();
         self.hot_tensor = Some(self.lookup_from_host(&ids, device, DType::BF16)?);
+        self.hot_device = Some(device.clone());
         self.hot_dirty = false;
         Ok(())
     }
@@ -212,6 +216,11 @@ mod tests {
         assert_eq!(embedding.vocab_size(), 4);
         assert_eq!(embedding.hidden_size(), 3);
         assert_eq!(embedding.lookup(&ids, &Device::Cpu, DType::BF16).unwrap().dtype(), DType::BF16);
+    }
+
+    #[test]
+    fn default_hot_cache_rows_matches_voice_assistant_budget() {
+        assert_eq!(DEFAULT_HOT_CACHE_ROWS, 32);
     }
 
     #[test]
@@ -305,6 +314,23 @@ mod tests {
         let ids = Tensor::new(&[0u32, 4], &Device::Cpu).unwrap();
 
         assert!(embedding.lookup(&ids, &Device::Cpu, DType::F32).is_err());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn rebuilds_hot_tensor_when_lookup_device_changes() {
+        let cuda = Device::new_cuda(0).unwrap();
+        let embedding = HybridEmbedding::from_tensor(&test_weights(), 2).unwrap();
+        let cuda_ids = Tensor::new(&[0u32, 1], &cuda).unwrap();
+
+        let _ = embedding.lookup(&cuda_ids, &cuda, DType::BF16).unwrap();
+
+        let cpu_ids = Tensor::new(&[0u32, 1], &Device::Cpu).unwrap();
+        let output = embedding.lookup(&cpu_ids, &Device::Cpu, DType::F32).unwrap();
+        let baseline = test_weights().index_select(&cpu_ids, 0).unwrap();
+
+        assert!(output.device().same_device(&Device::Cpu));
+        assert_close(&output.to_vec2::<f32>().unwrap(), &baseline.to_vec2::<f32>().unwrap(), 0.01);
     }
 
     fn assert_close(actual: &[Vec<f32>], expected: &[Vec<f32>], tolerance: f32) {
