@@ -1,3 +1,4 @@
+use crate::models::layers::hybrid_embedding::{HybridEmbedding, DEFAULT_HOT_CACHE_ROWS};
 use crate::models::layers::VarBuilderX;
 use candle_core::{DType, IndexOp, Result, Tensor, WithDType};
 use candle_nn::{var_builder::Shard, Module};
@@ -131,6 +132,17 @@ pub fn embedding(
         }
     };
     Ok((Embedding::new(embeddings, hidden_size), vocab_size))
+}
+
+pub fn hybrid_embedding(
+    vocab_size: Option<usize>,
+    hidden_size: usize,
+    vb: VarBuilderX,
+    dtype: DType,
+) -> Result<(HybridEmbedding, usize)> {
+    let (embedding, vocab_size) = embedding(vocab_size, hidden_size, vb, dtype)?;
+    let hybrid = HybridEmbedding::from_tensor(embedding.embeddings(), DEFAULT_HOT_CACHE_ROWS)?;
+    Ok((hybrid, vocab_size))
 }
 
 fn dequantize_mlx_nvfp4_embedding(

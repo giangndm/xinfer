@@ -1,13 +1,14 @@
 // src/models/qwen3_moe.rs
 use crate::models::layers::attention::Attention;
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
+use crate::models::layers::hybrid_embedding::HybridEmbedding;
 use crate::models::layers::linear::LinearX as Linear;
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::moe::{
     FusedMoe, FusedMoeFp8, FusedMoeGGUF, FusedMoeISQ, FusedMoeMxfp4, FusedMoeNvfp4,
 };
-use crate::models::layers::others::{embedding, rms_norm, NormX};
+use crate::models::layers::others::{hybrid_embedding, rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbedding};
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
@@ -293,7 +294,7 @@ impl Qwen3DecoderLayer {
 }
 
 pub struct Qwen3MoEForCausalLM {
-    embed_tokens: candle_nn::Embedding,
+    embed_tokens: HybridEmbedding,
     layers: Vec<Qwen3DecoderLayer>,
     norm: NormX,
     lm_head: VocabParallelLinear,
@@ -366,7 +367,7 @@ impl Qwen3MoEForCausalLM {
             config.tie_word_embeddings
         };
 
-        let (embed_tokens, vocab_size) = embedding(
+        let (embed_tokens, vocab_size) = hybrid_embedding(
             config.vocab_size,
             config.hidden_size,
             if is_qvar_builder {
