@@ -134,15 +134,9 @@ impl HybridEmbeddingInner {
         }
 
         self.rebuild_hot_tensor_if_needed(device)?;
-        let slot_ids = ids
-            .iter()
-            .map(|id| {
-                self.hot_slots
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| candle_core::Error::msg(format!("token id {id} missing from hot cache after touch")))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let Some(slot_ids) = ids.iter().map(|id| self.hot_slots.get(id).copied()).collect::<Option<Vec<_>>>() else {
+            return self.lookup_from_host(&ids, device, output_dtype);
+        };
         let slot_ids = slot_ids.into_iter().map(|slot| slot as u32).collect::<Vec<_>>();
         let slot_tensor = Tensor::from_vec(slot_ids, ids.len(), device)?;
         let hot_tensor = self.hot_tensor.as_ref().ok_or_else(|| candle_core::Error::msg("hot cache tensor was not initialized"))?;
@@ -314,6 +308,23 @@ mod tests {
         let ids = Tensor::new(&[0u32, 4], &Device::Cpu).unwrap();
 
         assert!(embedding.lookup(&ids, &Device::Cpu, DType::F32).is_err());
+    }
+
+    #[test]
+    fn falls_back_when_hot_slot_map_misses_touched_row() {
+        let embedding = HybridEmbedding::from_tensor(&test_weights(), 4).unwrap();
+        {
+            let mut inner = embedding.inner.lock();
+            inner.hot_order.extend([0, 1]);
+            inner.hot_slots.insert(1, 1);
+            inner.hot_dirty = true;
+        }
+        let ids = Tensor::new(&[0u32, 1], &Device::Cpu).unwrap();
+
+        let output = embedding.lookup(&ids, &Device::Cpu, DType::F32).unwrap();
+        let baseline = test_weights().index_select(&ids, 0).unwrap();
+
+        assert_close(&output.to_vec2::<f32>().unwrap(), &baseline.to_vec2::<f32>().unwrap(), 0.01);
     }
 
     #[cfg(feature = "cuda")]
