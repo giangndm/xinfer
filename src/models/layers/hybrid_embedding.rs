@@ -51,7 +51,10 @@ impl HybridEmbedding {
     pub fn from_tensor(weights: &Tensor, hot_cache_rows: usize) -> Result<Self> {
         let dims = weights.dims();
         if dims.len() != 2 {
-            candle_core::bail!("embedding weights must be rank 2, got shape {:?}", weights.shape());
+            candle_core::bail!(
+                "embedding weights must be rank 2, got shape {:?}",
+                weights.shape()
+            );
         }
         let vocab_size = dims[0];
         let hidden_size = dims[1];
@@ -77,7 +80,12 @@ impl HybridEmbedding {
         self.lookup(input_ids, input_ids.device(), DType::BF16)
     }
 
-    pub fn lookup(&self, input_ids: &Tensor, device: &Device, output_dtype: DType) -> Result<Tensor> {
+    pub fn lookup(
+        &self,
+        input_ids: &Tensor,
+        device: &Device,
+        output_dtype: DType,
+    ) -> Result<Tensor> {
         self.inner.lock().lookup(input_ids, device, output_dtype)
     }
 
@@ -103,8 +111,16 @@ impl HybridEmbedding {
 }
 
 impl HybridEmbeddingInner {
-    fn lookup(&mut self, input_ids: &Tensor, device: &Device, output_dtype: DType) -> Result<Tensor> {
-        let ids = input_ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+    fn lookup(
+        &mut self,
+        input_ids: &Tensor,
+        device: &Device,
+        output_dtype: DType,
+    ) -> Result<Tensor> {
+        let ids = input_ids
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<u32>()?;
         if ids.is_empty() {
             return Tensor::zeros((0, self.hidden_size), output_dtype, device);
         }
@@ -134,18 +150,33 @@ impl HybridEmbeddingInner {
         }
 
         self.rebuild_hot_tensor_if_needed(device)?;
-        let Some(slot_ids) = ids.iter().map(|id| self.hot_slots.get(id).copied()).collect::<Option<Vec<_>>>() else {
+        let Some(slot_ids) = ids
+            .iter()
+            .map(|id| self.hot_slots.get(id).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
             return self.lookup_from_host(&ids, device, output_dtype);
         };
-        let slot_ids = slot_ids.into_iter().map(|slot| slot as u32).collect::<Vec<_>>();
+        let slot_ids = slot_ids
+            .into_iter()
+            .map(|slot| slot as u32)
+            .collect::<Vec<_>>();
         let slot_tensor = Tensor::from_vec(slot_ids, ids.len(), device)?;
-        let hot_tensor = self.hot_tensor.as_ref().ok_or_else(|| candle_core::Error::msg("hot cache tensor was not initialized"))?;
-        hot_tensor.index_select(&slot_tensor, 0)?.to_dtype(output_dtype)
+        let hot_tensor = self
+            .hot_tensor
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::msg("hot cache tensor was not initialized"))?;
+        hot_tensor
+            .index_select(&slot_tensor, 0)?
+            .to_dtype(output_dtype)
     }
 
     fn touch_hot_row(&mut self, id: u32, stats: &mut HybridEmbeddingLookupStats) -> Result<()> {
         if id as usize >= self.vocab_size {
-            candle_core::bail!("token id {id} is outside embedding vocab size {}", self.vocab_size);
+            candle_core::bail!(
+                "token id {id} is outside embedding vocab size {}",
+                self.vocab_size
+            );
         }
         if self.hot_slots.contains_key(&id) {
             stats.hits += 1;
@@ -154,7 +185,9 @@ impl HybridEmbeddingInner {
 
         stats.misses += 1;
         if self.hot_order.len() == self.hot_cache_rows {
-            let evicted = self.hot_order.pop_front().ok_or_else(|| candle_core::Error::msg("hot cache capacity reached with empty order"))?;
+            let evicted = self.hot_order.pop_front().ok_or_else(|| {
+                candle_core::Error::msg("hot cache capacity reached with empty order")
+            })?;
             self.hot_slots.remove(&evicted);
             stats.evictions += 1;
         }
@@ -172,7 +205,10 @@ impl HybridEmbeddingInner {
     }
 
     fn rebuild_hot_tensor_if_needed(&mut self, device: &Device) -> Result<()> {
-        let hot_device_matches = self.hot_device.as_ref().is_some_and(|hot_device| hot_device.same_device(device));
+        let hot_device_matches = self
+            .hot_device
+            .as_ref()
+            .is_some_and(|hot_device| hot_device.same_device(device));
         if !self.hot_dirty && self.hot_tensor.is_some() && hot_device_matches {
             return Ok(());
         }
@@ -183,14 +219,22 @@ impl HybridEmbeddingInner {
         Ok(())
     }
 
-    fn lookup_from_host(&self, ids: &[u32], device: &Device, output_dtype: DType) -> Result<Tensor> {
+    fn lookup_from_host(
+        &self,
+        ids: &[u32],
+        device: &Device,
+        output_dtype: DType,
+    ) -> Result<Tensor> {
         for id in ids {
             if *id as usize >= self.vocab_size {
                 candle_core::bail!("token id {id} is outside embedding host storage");
             }
         }
         let id_tensor = Tensor::from_vec(ids.to_vec(), ids.len(), &Device::Cpu)?;
-        self.host_weights.index_select(&id_tensor, 0)?.to_device(device)?.to_dtype(output_dtype)
+        self.host_weights
+            .index_select(&id_tensor, 0)?
+            .to_device(device)?
+            .to_dtype(output_dtype)
     }
 }
 
@@ -199,7 +243,16 @@ mod tests {
     use super::*;
 
     fn test_weights() -> Tensor {
-        Tensor::new(&[[0.0f32, 0.1, 0.2], [1.0, 1.1, 1.2], [2.0, 2.1, 2.2], [3.0, 3.1, 3.2]], &Device::Cpu).unwrap()
+        Tensor::new(
+            &[
+                [0.0f32, 0.1, 0.2],
+                [1.0, 1.1, 1.2],
+                [2.0, 2.1, 2.2],
+                [3.0, 3.1, 3.2],
+            ],
+            &Device::Cpu,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -209,7 +262,13 @@ mod tests {
 
         assert_eq!(embedding.vocab_size(), 4);
         assert_eq!(embedding.hidden_size(), 3);
-        assert_eq!(embedding.lookup(&ids, &Device::Cpu, DType::BF16).unwrap().dtype(), DType::BF16);
+        assert_eq!(
+            embedding
+                .lookup(&ids, &Device::Cpu, DType::BF16)
+                .unwrap()
+                .dtype(),
+            DType::BF16
+        );
     }
 
     #[test]
@@ -226,7 +285,11 @@ mod tests {
         let output = embedding.lookup(&ids, &Device::Cpu, DType::F32).unwrap();
         let baseline = weights.index_select(&ids, 0).unwrap();
 
-        assert_close(&output.to_vec2::<f32>().unwrap(), &baseline.to_vec2::<f32>().unwrap(), 0.01);
+        assert_close(
+            &output.to_vec2::<f32>().unwrap(),
+            &baseline.to_vec2::<f32>().unwrap(),
+            0.01,
+        );
         assert_eq!(
             embedding.last_stats(),
             HybridEmbeddingLookupStats {
@@ -261,16 +324,24 @@ mod tests {
     fn handles_unique_ids_larger_than_hot_cache() {
         let vocab_size = 4096;
         let hidden_size = 2;
-        let values = (0..vocab_size * hidden_size).map(|idx| (idx % 64) as f32 / 64.0).collect::<Vec<_>>();
+        let values = (0..vocab_size * hidden_size)
+            .map(|idx| (idx % 64) as f32 / 64.0)
+            .collect::<Vec<_>>();
         let weights = Tensor::from_vec(values, (vocab_size, hidden_size), &Device::Cpu).unwrap();
         let ids = (0..vocab_size as u32).collect::<Vec<_>>();
         let ids_tensor = Tensor::from_vec(ids, vocab_size, &Device::Cpu).unwrap();
         let embedding = HybridEmbedding::from_tensor(&weights, 1024).unwrap();
 
-        let output = embedding.lookup(&ids_tensor, &Device::Cpu, DType::F32).unwrap();
+        let output = embedding
+            .lookup(&ids_tensor, &Device::Cpu, DType::F32)
+            .unwrap();
         let baseline = weights.index_select(&ids_tensor, 0).unwrap();
 
-        assert_close(&output.to_vec2::<f32>().unwrap(), &baseline.to_vec2::<f32>().unwrap(), 0.01);
+        assert_close(
+            &output.to_vec2::<f32>().unwrap(),
+            &baseline.to_vec2::<f32>().unwrap(),
+            0.01,
+        );
         assert_eq!(
             embedding.last_stats(),
             HybridEmbeddingLookupStats {
@@ -324,7 +395,11 @@ mod tests {
         let output = embedding.lookup(&ids, &Device::Cpu, DType::F32).unwrap();
         let baseline = test_weights().index_select(&ids, 0).unwrap();
 
-        assert_close(&output.to_vec2::<f32>().unwrap(), &baseline.to_vec2::<f32>().unwrap(), 0.01);
+        assert_close(
+            &output.to_vec2::<f32>().unwrap(),
+            &baseline.to_vec2::<f32>().unwrap(),
+            0.01,
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -337,11 +412,17 @@ mod tests {
         let _ = embedding.lookup(&cuda_ids, &cuda, DType::BF16).unwrap();
 
         let cpu_ids = Tensor::new(&[0u32, 1], &Device::Cpu).unwrap();
-        let output = embedding.lookup(&cpu_ids, &Device::Cpu, DType::F32).unwrap();
+        let output = embedding
+            .lookup(&cpu_ids, &Device::Cpu, DType::F32)
+            .unwrap();
         let baseline = test_weights().index_select(&cpu_ids, 0).unwrap();
 
         assert!(output.device().same_device(&Device::Cpu));
-        assert_close(&output.to_vec2::<f32>().unwrap(), &baseline.to_vec2::<f32>().unwrap(), 0.01);
+        assert_close(
+            &output.to_vec2::<f32>().unwrap(),
+            &baseline.to_vec2::<f32>().unwrap(),
+            0.01,
+        );
     }
 
     fn assert_close(actual: &[Vec<f32>], expected: &[Vec<f32>], tolerance: f32) {
